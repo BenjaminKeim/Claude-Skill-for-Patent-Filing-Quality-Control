@@ -1291,7 +1291,7 @@ class PatentFilingQC:
     def load_documents(self):
         """Locate and load all filing documents by classifying every PDF in the
         folder by *content*, not filename. Files named 'Application.pdf',
-        'Formals.pdf', 'MS3-0230US-A.pdf', etc. are all handled as long as
+        'Formals.pdf', 'AB2-5678US-A.pdf', etc. are all handled as long as
         their contents identify them.
         """
         # Initialize all six slots so the report's "Documents Found" list shows
@@ -1639,8 +1639,8 @@ class PatentFilingQC:
     def extract_docket_numbers(self, text: str) -> set:
         """Extract ALL docket-shaped tokens from text. Patent filings often
         carry both a Client Docket and an Attorney Docket (e.g.,
-        'Client Docket No.: 412147-US-NP' alongside 'Attorney Docket No.:
-        MS1-9771US'). Cross-doc consistency checks need to know about both,
+        'Client Docket No.: 987654-US-NP' alongside 'Attorney Docket No.:
+        AB1-1234US'). Cross-doc consistency checks need to know about both,
         not just whichever appears first."""
         dockets = set()
         # 1. Explicit "<X> Docket No.: <docket>" patterns (highest confidence).
@@ -1656,7 +1656,7 @@ class PatentFilingQC:
                 dockets.add(d)
         # 2. Common bare docket-shaped tokens — dash-separated alphanumeric
         #    sequences with at least one digit (catches both styles like
-        #    "MS1-9771USC3" and "412147-US-NP").
+        #    "AB1-1234USC3" and "987654-US-NP").
         for m in re.finditer(
             r'\b([A-Z]{1,5}\d{1,5}[-_]\d{2,5}[A-Z0-9\-_]{0,15})\b',
             text, re.IGNORECASE
@@ -3496,7 +3496,7 @@ class PatentFilingQC:
         # Check 23: Drawings have margin labels (title and docket number).
         # Use the actual docket from XFA when available (the original code's
         # docket regex matched only "A123-4567"-style and missed real-world
-        # firm/customer dockets like "MS1-9771USC3" or "412147-US03-CON").
+        # firm/customer dockets like "AB1-1234USC3" or "987654-US03-CON").
         issues_23 = []
 
         # Title check — look for any title word appearing in drawings

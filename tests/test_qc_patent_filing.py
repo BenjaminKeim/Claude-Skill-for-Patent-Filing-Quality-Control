@@ -50,8 +50,8 @@ BASE_INVENTORS = [
 BASE_ADS = {
     "inventors": BASE_INVENTORS,
     "title": "MEMORY-EFFICIENT INFERENCE FOR LARGE LANGUAGE MODELS",
-    "docket_number": "LUM-0142US", "customer_number": "142810",
-    "attorney_customer_number": "142810", "form_pages": "9",
+    "docket_number": "LUM-0142US", "customer_number": "123456",
+    "attorney_customer_number": "123456", "form_pages": "9",
     "small_entity": False, "application_type": "REGULAR",
     "submission_type": "UTL", "drawing_sheets": "8",
     "representative_figure": "1", "non_publication": False,
@@ -112,7 +112,7 @@ Assignee, LUMINA AI, INC., the entire right, title and interest.
 BASE_POA = """POWER OF ATTORNEY (PTO/AIA/82B)
 Attorney Docket Number: LUM-0142US
 Applicant: LUMINA AI, INC.
-Customer Number: 142810
+Customer Number: 123456
 First Named Inventor Sarah J. CHEN
 /Catherine A. Reyes/  Registration Number: 73415  Date: 2025-09-12
 """
@@ -211,7 +211,7 @@ def t():
 
 @test("F2.4: Check 4 → CRITICAL when customer number mismatch")
 def t():
-    qc = build_qc(poa=BASE_POA.replace('142810', '999999'))
+    qc = build_qc(poa=BASE_POA.replace('123456', '999999'))
     return assert_severity(qc, 4, Severity.CRITICAL, "Check 4")
 
 @test("F2.5: Check 5 → WARN when assignee not in assignment")
@@ -971,7 +971,7 @@ def t():
            "First Named Inventor\n"
            "Sarah J. CHEN\n"
            "MEMORY-EFFICIENT INFERENCE FOR LARGE LANGUAGE MODELS\n"
-           "Customer Number: 142810\n")
+           "Customer Number: 123456\n")
     qc = build_qc(poa=poa)
     qc.documents['Power of Attorney'] = None  # force poa_text path (skip OCR branch)
     qc.run_all_checks()
