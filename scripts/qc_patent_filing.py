@@ -6859,7 +6859,7 @@ class PatentFilingQC:
             for pat in [
                 r'PCT/[A-Z]{2}\s?\d{2,4}/\d+',    # PCT/US2008/059500
                 r'\b\d{2}/\d{3},?\s?\d{3}\b',       # 12/345,678
-                r'\b6[0-2]/\d{3},?\s?\d{3}\b',       # 60/123,456 (provisional)
+                r'\b6\d/\d{3},?\s?\d{3}\b',          # 60/123,456 (provisional)
                 r'\b\d{8}\b',                         # 12345678 (plain 8-digit)
             ]:
                 for m in re.finditer(pat, text, re.IGNORECASE):
@@ -6894,15 +6894,21 @@ class PatentFilingQC:
             return uspto_odp.lookup_application(raw_app)
 
         # Build ADS number map: norm → (raw, date_str, entry_idx)
+        # Also note which numbers the ADS itself marks as provisional, since an
+        # unpublished provisional is never in ODP's public records.
         ads_num_map = {}
+        ads_prov_norms = set()
         for _idx, _entry in enumerate(ads_dom_entries):
             _date = (_entry.get('date') or '').strip()
+            _prov_entry = 'PROV' in (_entry.get('continuation_type') or '').upper()
             for _field in ('application_number', 'prior_application_number'):
                 _raw = (_entry.get(_field) or '').strip()
                 if _raw:
                     _n = _norm81(_raw)
                     if _n and _n not in ads_num_map:
                         ads_num_map[_n] = (_raw, _date, _idx + 1)
+                    if _n and _prov_entry:
+                        ads_prov_norms.add(_n)
 
         # Extract spec priority paragraph and its application numbers
         _spec_para = None
@@ -6943,14 +6949,18 @@ class PatentFilingQC:
             bad_key = False
 
             for _n, (_raw, _date, _eidx) in ads_num_map.items():
+                # Provisional series codes are 60-6x (60, 61, 62, 63, 64, ...);
+                # no other application series starts with 6.
                 _is_provisional = bool(
-                    re.match(r'^6[01]/', _raw.strip()) or
-                    re.match(r'^6[01]\d{6}$', _n)
+                    _n in ads_prov_norms or
+                    re.match(r'^6\d/', _raw.strip()) or
+                    re.match(r'^6\d{7}$', _n)
                 )
                 if _is_provisional:
                     a1_pre2001.append(
-                        f"Entry {_eidx} ({_raw}): provisional — "
-                        f"not indexed in USPTO ODP; verify via link below"
+                        f"Entry {_eidx} ({_raw}): provisional — unpublished, so "
+                        f"not in USPTO ODP public records; verify against the "
+                        f"provisional filing receipt or via link below"
                     )
                     continue
                 _yr = _parse_year_from(_raw, _date)

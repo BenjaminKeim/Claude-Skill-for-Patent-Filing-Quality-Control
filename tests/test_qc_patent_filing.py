@@ -1343,6 +1343,39 @@ def t():
         print(f"  ❌ Patent Center link missing from details"); return False
     return True
 
+@test("PRI16.5: Check 81 Branch A does not flag an unpublished provisional (63/64 series)")
+def t():
+    # Provisionals are never published, so ODP returns not_found for them. Only
+    # 60/61 used to be recognized as provisional, so a 64-series provisional
+    # was reported CRITICAL "not found in USPTO public records". The stub client
+    # answers not_found for everything, so any lookup that leaks through is caught.
+    class _StubODP:
+        calls = []
+        @staticmethod
+        def lookup_application(raw):
+            _StubODP.calls.append(raw)
+            return {'error': 'not_found', 'filing_date': '',
+                    'status_desc': '', 'patent_number': ''}
+    saved_key, saved_odp = _qcmod._load_odp_api_key, _qcmod.uspto_odp
+    _qcmod._load_odp_api_key = lambda: 'stub-key'
+    _qcmod.uspto_odp = _StubODP
+    try:
+        for num, ctype in (('64/000,000', 'PROV'), ('63/000,000', ''),
+                           ('19000000', 'PROV')):
+            _StubODP.calls.clear()
+            ads = _ads_with_continuity(num)
+            ads['domestic_continuity_entries'][0]['continuation_type'] = ctype
+            qc = build_qc(ads_data=ads)
+            qc.run_all_checks()
+            crit = [i for i in get_checks(qc, 81) if i.severity == Severity.CRITICAL]
+            if crit or _StubODP.calls:
+                print(f"  ❌ {num} ({ctype or 'no type'}): CRITICAL={len(crit)}, "
+                      f"ODP lookups={_StubODP.calls}")
+                return False
+    finally:
+        _qcmod._load_odp_api_key, _qcmod.uspto_odp = saved_key, saved_odp
+    return True
+
 # ============================================================
 # 17. --lightweight (filing-identity-only) mode
 # ============================================================
