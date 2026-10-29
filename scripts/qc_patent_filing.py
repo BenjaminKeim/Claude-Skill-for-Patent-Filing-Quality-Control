@@ -402,13 +402,21 @@ class PatentFilingQC:
             cleaned_pages.append('\n'.join(kept))
         return cleaned_pages
 
-    def _join_page_texts(self, page_texts: List[str]) -> str:
+    def _join_page_texts(self, page_texts: List[str], doc_type: str = "") -> str:
         """Single choke point for turning a list of per-page text into one
         document string. Every PDF text-extraction technique (pdfplumber,
         PyPDF2, pytesseract OCR, tesseract-CLI OCR) funnels its page list
-        through here, so repeating headers/footers are stripped identically no
-        matter which technique produced the pages — the detection logic lives
-        once in _strip_repeating_headers_footers()."""
+        through here, so repeating headers/footers are stripped identically
+        no matter which technique produced the pages — the detection logic
+        lives once in _strip_repeating_headers_footers().
+
+        Drawings are exempt. On a drawing sheet the page-edge lines ARE the
+        content the checks need: the FIG. label sits at the bottom of every
+        sheet and the docket/title identifier at the top, so the repeating-line
+        detector reads them as boilerplate and strips exactly what checks 15,
+        22, 23 and 61 look for."""
+        if doc_type == 'Drawings':
+            return "".join(pt + "\n" for pt in page_texts)
         return "".join(pt + "\n" for pt in self._strip_repeating_headers_footers(page_texts))
 
     def extract_pdf_text(self, pdf_path: Path, doc_type: str = "Document") -> str:
@@ -433,7 +441,7 @@ class PatentFilingQC:
                         # Page has no extractable text but does contain images
                         # — typical scanned signed page on declaration/assignment.
                         image_only_count += 1
-            text = self._join_page_texts(page_texts)
+            text = self._join_page_texts(page_texts, doc_type)
             if image_only_count > 0:
                 self.image_only_pages[doc_type] = image_only_count
             clean_text = text.strip()
@@ -450,7 +458,7 @@ class PatentFilingQC:
             with open(pdf_path, 'rb') as file:
                 reader = PyPDF2.PdfReader(file)
                 page_texts = [pt for pt in (p.extract_text() for p in reader.pages) if pt]
-            text = self._join_page_texts(page_texts)
+            text = self._join_page_texts(page_texts, doc_type)
 
             # Check if we got meaningful text (more than just whitespace/boilerplate)
             clean_text = text.strip()
@@ -484,64 +492,168 @@ class PatentFilingQC:
             return ""
 
     @staticmethod
-    def _extract_page_text_corrected(page) -> str:
-        """Extract a pdfplumber page's text, correcting for rotated figure text.
+    def _char_rotation(ch) -> str:
+        """Classify a pdfplumber char by the rotation baked into its text
+        matrix (a, b, c, d, x, y), where a rotation of θ gives
+        (cos θ, sin θ, -sin θ, cos θ):
 
-        Patent drawing sheets place landscape figures rotated 90° on the portrait
-        filing sheet (standard USPTO practice). Their labels and callouts are
-        drawn as rotated glyphs (text matrix (0, ±b, ∓c, 0)); pdfplumber's default
-        position-sorted extraction then reads each rotated word in reverse
-        ("FIG. 1" -> ".GIF 1", "106" -> "601"), so the figure and reference-
-        numeral checks miss them.
+          'up'   — upright (θ=0), read left-to-right
+          'ccw'  — θ=+90°, baseline advances +y, letters stack bottom-to-top
+          'cw'   — θ=-90°/270°, baseline advances -y, letters stack top-to-bottom
+          'flip' — θ=180°, baseline advances -x, letters run right-to-left
 
-        Fix: when a page is substantially rotated text, rebuild it from the
-        content-stream character order — the true reading order for CAD/Visio
-        drawing exports — inserting a space wherever consecutive glyphs are far
-        enough apart to be separate words. Upright pages (normal specs,
-        declarations, etc.) fall through to pdfplumber's layout-aware extraction
-        unchanged. Handles both rotation directions.
+        A single drawing set routinely mixes these: portrait sheets with
+        upright labels, landscape sheets rotated one way or the other, and
+        individual vertical callouts inside an otherwise upright sheet.
         """
-        chars = page.chars
-        if not chars:
+        m = ch.get('matrix') or (1, 0, 0, 1, 0, 0)
+        a, b, c, d = m[0], m[1], m[2], m[3]
+        if abs(a) < 0.01 and abs(d) < 0.01:
+            if b > 0 and c < 0:
+                return 'ccw'
+            if b < 0 and c > 0:
+                return 'cw'
+            return 'up'
+        if a < 0 and d < 0:
+            return 'flip'
+        return 'up'
+
+    @classmethod
+    def _reconstruct_rotated_words(cls, page) -> List[Tuple[str, Optional[str]]]:
+        """Recover correctly-ordered words from every rotated text run on a page.
+
+        Patent drawing tools (Visio, CAD) store figure labels and callouts as
+        rotated text. pdfplumber's linear extraction always reads chars
+        top-to-bottom then left-to-right, which garbles any run whose baseline
+        doesn't point that way — "SYSTEM" → "METSYS", "FIG. 6A" → "A6.GIF".
+
+        Returns (correct_word, emitted_form) pairs, where emitted_form is the
+        character sequence pdfplumber's linear extraction produced for that
+        word. Handles all four orientations so mixed-orientation drawing sets
+        work uniformly. Note that the emitted form matching the correct one
+        does NOT mean no repair is needed: a vertical run emits one character
+        per output line, so even a correctly-ordered label arrives as
+        "F\\nI\\nG\\n.\\n3" and still has to be rejoined.
+        """
+        chars = page.chars or []
+        groups: Dict[str, List] = {'ccw': [], 'cw': [], 'flip': []}
+        for ch in chars:
+            rot = cls._char_rotation(ch)
+            if rot in groups:
+                groups[rot].append(ch)
+
+        out: List[Tuple[str, Optional[str]]] = []
+        for rot, rot_chars in groups.items():
+            if not rot_chars:
+                continue
+            vertical = rot in ('ccw', 'cw')
+            # Chars sharing a baseline share an x-position (vertical runs) or a
+            # top-position (horizontal runs). Group by that within ±2pt.
+            baseline = (lambda c: c['x0']) if vertical else (lambda c: c['top'])
+            along = (lambda c: c['y0']) if vertical else (lambda c: c['x0'])
+            rot_chars.sort(key=lambda c: (baseline(c), along(c)))
+            runs: List[List] = []
+            for ch in rot_chars:
+                if runs and abs(baseline(ch) - baseline(runs[-1][-1])) < 2.0:
+                    runs[-1].append(ch)
+                else:
+                    runs.append([ch])
+
+            for run in runs:
+                # Sort along the baseline direction to recover reading order.
+                if rot == 'ccw':
+                    run.sort(key=lambda c: along(c))          # bottom-to-top
+                else:
+                    run.sort(key=lambda c: -along(c))         # cw / flip
+                dim = 'height' if vertical else 'width'
+                avg = sum(abs(c.get(dim) or 8) for c in run) / len(run) or 8.0
+
+                # Split the run into words at gaps larger than 2× char size.
+                # The gap is measured edge to edge, not start to start: Visio
+                # labels mix glyph sizes ("F" and "G" of "FIG. 6" are ~2× the
+                # "I"), so a start-to-start distance across one tall glyph can
+                # exceed the threshold and cut a label into "F" + "IG" + ". 6".
+                start, end = (('y0', 'y1') if vertical else ('x0', 'x1'))
+                words: List[List] = [[run[0]]]
+                for ch in run[1:]:
+                    prev = words[-1][-1]
+                    gap = max(ch[start] - prev[end], prev[start] - ch[end])
+                    if gap > avg * 2:
+                        words.append([ch])
+                    else:
+                        words[-1].append(ch)
+
+                for word_chars in words:
+                    correct = ''.join(c['text'] for c in word_chars).strip()
+                    # Skip single chars — reversing them is a no-op and risks
+                    # replacing unrelated single letters in the extracted text.
+                    if len(correct) < 2:
+                        continue
+                    # 'cw' runs read top-to-bottom, the direction pdfplumber
+                    # already walks, so their characters come out in order;
+                    # 'ccw' and 'flip' come out reversed.
+                    emitted = correct if rot == 'cw' else correct[::-1]
+                    out.append((correct, emitted))
+        return out
+
+    @classmethod
+    def _extract_page_text_corrected(cls, page) -> str:
+        """Extract text from a pdfplumber page with rotated text repaired.
+
+        Starts from pdfplumber's linear extraction, then for each rotated word
+        recovered by _reconstruct_rotated_words() replaces the garbled form
+        with the correct one. Any word that can't be located in the linear text
+        is appended to the page instead, so a recovered label is never silently
+        lost — that append is what keeps the FIG.-label and docket checks
+        working on sheets where pdfplumber breaks a rotated label across output
+        lines ("FIG. 1" → "1\\n.GIF", which no in-place pattern can match).
+        """
+        if not page.chars:
             return ""
 
-        def _is_rotated(c):
-            m = c.get('matrix', (1, 0, 0, 1, 0, 0))
-            # 90° in either direction: diagonal ~0, off-diagonal non-zero.
-            return (abs(m[0]) < 0.01 and abs(m[3]) < 0.01
-                    and abs(m[1]) > 0.01 and abs(m[2]) > 0.01)
+        text = page.extract_text() or ""
+        recovered = cls._reconstruct_rotated_words(page)
+        if not recovered:
+            return text
 
-        # Only intervene when rotation is significant; otherwise trust
-        # pdfplumber's layout-aware extraction (leaves normal documents as-is).
-        if sum(1 for c in chars if _is_rotated(c)) < len(chars) * 0.2:
-            return page.extract_text() or ""
+        unplaced: List[str] = []
+        for correct, emitted in recovered:
+            if not emitted:
+                continue
+            if emitted in text:
+                # Contiguous in the linear text: rewrite it, or leave it alone
+                # if it already reads correctly.
+                if emitted != correct:
+                    text = text.replace(emitted, correct, 1)
+                continue
+            # Not contiguous in the linear text — pdfplumber split it across
+            # output lines. Rewrite it in place for FIG. labels, where the
+            # pattern is distinctive enough to match safely; for anything else
+            # (bare numerals especially) a whitespace-tolerant match could
+            # stitch together two unrelated tokens, so append instead.
+            loose = r'\s*'.join(
+                re.escape(c) for c in emitted if not c.isspace()
+            )
+            if re.match(r'FIG\.?\s*\d', correct, re.IGNORECASE):
+                text, n = re.subn(loose, lambda m: correct, text, count=1)
+                if n:
+                    continue
+            unplaced.append(correct)
 
-        parts = []
-        prev = None
-        for c in chars:
-            if prev is not None:
-                # Shortest gap between the two glyph boxes (orientation-agnostic):
-                # a large gap means a new word.
-                dx = max(prev['x0'] - c['x1'], c['x0'] - prev['x1'], 0)
-                dy = max(prev['top'] - c['bottom'], c['top'] - prev['bottom'], 0)
-                gap = (dx * dx + dy * dy) ** 0.5
-                size = max(c.get('height', 8), c.get('width', 8), 4)
-                if gap > size * 0.6:
-                    parts.append(' ')
-            parts.append(c['text'])
-            prev = c
-        return ''.join(parts)
+        if unplaced:
+            text = text.rstrip('\n') + '\n' + '\n'.join(unplaced)
+        return text
 
     def _ocr_pdf_text(self, pdf_path: Path, doc_type: str) -> Optional[str]:
-        """OCR every page of a PDF into a single text string. Returns the OCR
+        """OCR every page of a PDF into a simple text string. Returns the OCR
         text, or None on error (the failure is reported before returning).
         Shared by the image-only fallback and the signed-form inventor-name
         recovery path (_maybe_ocr_for_names)."""
         try:
             images = convert_from_path(pdf_path)
-            page_texts = [pt for pt in
-                          (pytesseract.image_to_string(image) for image in images) if pt]
-            return self._join_page_texts(page_texts)
+            page_texts = [pytesseract.image_to_string(image) for image in images]
+            page_texts = [pt for pt in page_texts if pt]
+            return self._join_page_texts(page_texts, doc_type)
         except Exception as ocr_error:
             self._document_read_failure(doc_type, pdf_path, f"OCR failed: {str(ocr_error)}")
             return None

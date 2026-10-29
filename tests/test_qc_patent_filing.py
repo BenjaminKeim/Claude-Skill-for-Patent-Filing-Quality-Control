@@ -741,6 +741,161 @@ def t():
         print(f"  ❌ image-only wrongly classified as extractable"); return False
     return True
 
+# ---- Mixed text orientations within one drawing set --------------------------
+# A real set routinely mixes upright portrait sheets, landscape sheets rotated
+# either way, and vertical callouts inside an otherwise upright sheet. The
+# rotation lives in each char's text matrix; pdfplumber's linear extraction
+# always walks top-to-bottom then left-to-right, so every run whose baseline
+# points elsewhere arrives garbled. These tests build synthetic pdfplumber-
+# shaped pages for all four orientations and assert the FIG. label survives.
+
+_ROT_MATRIX = {                     # (cos θ, sin θ, -sin θ, cos θ)
+    'up':   (1, 0, 0, 1, 0, 0),
+    'ccw':  (0, 1, -1, 0, 0, 0),    # θ=+90°, letters stack bottom-to-top
+    'cw':   (0, -1, 1, 0, 0, 0),    # θ=-90°, letters stack top-to-bottom
+    'flip': (-1, 0, 0, -1, 0, 0),   # θ=180°, letters run right-to-left
+}
+
+def _rot_word(word, rot, x, y):
+    """Lay `word` out in reading order at (x, y) with the given rotation."""
+    chars = []
+    for i, ch in enumerate(word):
+        if rot == 'up':
+            cx, cy = x + i * 6, y
+        elif rot == 'ccw':
+            cx, cy = x, y + i * 10
+        elif rot == 'cw':
+            cx, cy = x, y - i * 10
+        else:
+            cx, cy = x - i * 6, y
+        chars.append({'text': ch, 'matrix': _ROT_MATRIX[rot],
+                      'x0': cx, 'x1': cx + 6, 'y0': cy, 'y1': cy + 10,
+                      'top': 800 - cy, 'height': 10, 'width': 6})
+    return chars
+
+class _FakePage:
+    """Mimics pdfplumber: chars sorted by top then x0, lines split on top."""
+    def __init__(self, words):
+        self.chars = [c for w in words for c in _rot_word(*w)]
+    def extract_text(self):
+        lines = {}
+        for c in sorted(self.chars, key=lambda c: (round(c['top'], 1), c['x0'])):
+            lines.setdefault(round(c['top'], 1), []).append(c['text'])
+        return '\n'.join(''.join(v) for _, v in sorted(lines.items()))
+
+def _figs_on(words):
+    qc = PatentFilingQC(str(WORK))
+    page = _FakePage(words)
+    return qc._extract_figure_numbers(qc._extract_page_text_corrected(page))
+
+@test("RD12.12: CCW label with mixed glyph heights is not split into words")
+def t():
+    # Visio draws "F" and "G" of "FIG. 6" about twice the height of "I", ".",
+    # " ". With small rotated text sharing the baseline elsewhere on the sheet
+    # pulling the average glyph height down, a start-to-start gap across the
+    # tall "G" exceeded the word-break threshold and the label came out as
+    # "IG" + ". 6" — FIG. 6 reported missing from a complete set.
+    heights = {'F': 18.3, 'I': 8.3, 'G': 23.3, '.': 8.3, ' ': 8.3, '6': 16.7}
+    page = _FakePage([])
+    y = 100.0
+    label = []
+    for ch in "FIG. 6"[::-1]:          # ccw: reading order is bottom-to-top
+        h = heights[ch]
+        label.append({'text': ch, 'matrix': _ROT_MATRIX['ccw'], 'x0': 520,
+                      'x1': 550, 'y0': y, 'y1': y + h, 'top': 800 - y - h,
+                      'height': h, 'width': 30})
+        y += h
+    label.reverse()
+    page.chars = label + _rot_word("112", 'ccw', 520.5, 500) \
+        + _rot_word("114", 'ccw', 520.5, 600)
+    for c in page.chars[len(label):]:
+        c['height'] = 4
+        c['y1'] = c['y0'] + 4
+    qc = PatentFilingQC(str(WORK))
+    got = qc._extract_figure_numbers(qc._extract_page_text_corrected(page))
+    if got != [6]:
+        print(f"  ❌ mixed-height CCW label: {got}"); return False
+    return True
+
+@test("RD12.4: upright FIG. label read correctly")
+def t():
+    got = _figs_on([("FIG. 1", 'up', 100, 100)])
+    if got != [1]:
+        print(f"  ❌ upright label: {got}"); return False
+    return True
+
+@test("RD12.5: 90° CCW (bottom-to-top) FIG. label recovered")
+def t():
+    # pdfplumber emits this reversed AND split across lines ("1\n.GIF").
+    got = _figs_on([("FIG. 2", 'ccw', 100, 100)])
+    if got != [2]:
+        print(f"  ❌ CCW label: {got}"); return False
+    return True
+
+@test("RD12.6: 90° CW (top-to-bottom) FIG. label recovered")
+def t():
+    # Char order is already correct here, but the run still arrives one char
+    # per output line, so it needs rejoining rather than reversing.
+    got = _figs_on([("FIG. 3", 'cw', 100, 300)])
+    if got != [3]:
+        print(f"  ❌ CW label: {got}"); return False
+    return True
+
+@test("RD12.7: 180°-flipped FIG. label recovered")
+def t():
+    got = _figs_on([("FIG. 4", 'flip', 300, 100)])
+    if got != [4]:
+        print(f"  ❌ flipped label: {got}"); return False
+    return True
+
+@test("RD12.8: all orientations on one sheet recovered together")
+def t():
+    got = _figs_on([("FIG. 6", 'ccw', 50, 50), ("FIG. 7", 'cw', 400, 300),
+                    ("FIG. 8", 'up', 200, 700)])
+    if got != [6, 7, 8]:
+        print(f"  ❌ mixed-orientation sheet: {got}"); return False
+    return True
+
+@test("RD12.9: sub-figure label survives rotation")
+def t():
+    qc = PatentFilingQC(str(WORK))
+    page = _FakePage([("FIG. 9A", 'ccw', 100, 100)])
+    text = qc._extract_page_text_corrected(page)
+    if qc._extract_figure_identities(text) != ['9A']:
+        print(f"  ❌ rotated sub-figure: {qc._extract_figure_identities(text)}")
+        return False
+    return True
+
+@test("RD12.10: rotated non-label text un-reversed, not dropped")
+def t():
+    qc = PatentFilingQC(str(WORK))
+    page = _FakePage([("SYSTEM", 'ccw', 100, 100), ("COMMAND", 'flip', 400, 200)])
+    text = qc._extract_page_text_corrected(page)
+    if "SYSTEM" not in text or "COMMAND" not in text:
+        print(f"  ❌ rotated words not recovered: {text!r}"); return False
+    return True
+
+@test("RD12.11: drawings exempt from repeating header/footer stripping")
+def t():
+    # Every sheet carries a docket/title header and a FIG. label footer. The
+    # boilerplate detector reads those repeats as page furniture — but on a
+    # drawing sheet they ARE the content checks 15/22/23/61 need.
+    qc = PatentFilingQC(str(WORK))
+    pages = [f"Docket #: AB-2024-001\nTitle: Example\n{n}/3\n100\nFIG. {n}"
+             for n in (1, 2, 3)]
+    joined = qc._join_page_texts(pages, 'Drawings')
+    if qc._extract_figure_numbers(joined) != [1, 2, 3]:
+        print(f"  ❌ FIG. labels stripped as footers: {joined!r}"); return False
+    if 'AB-2024-001' not in joined:
+        print(f"  ❌ docket header stripped from drawings: {joined!r}"); return False
+    # Non-drawings docs must still get the stripping.
+    spec_pages = ["Docket #: AB-2024-001\nclaim text one",
+                  "Docket #: AB-2024-001\nclaim text two",
+                  "Docket #: AB-2024-001\nclaim text three"]
+    if 'AB-2024-001' in qc._join_page_texts(spec_pages, 'Specification'):
+        print("  ❌ header stripping no longer applied to non-drawings"); return False
+    return True
+
 # ============================================================
 # 13. Conditional OCR name-recovery for signed forms (Declaration/Assignment)
 #     Replaces PR #11's "always OCR" with: OCR only when the ADS inventor
