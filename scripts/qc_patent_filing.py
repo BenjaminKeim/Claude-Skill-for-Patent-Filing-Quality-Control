@@ -55,42 +55,40 @@ except ImportError:
 # pdfplumber is also required for clean text extraction; we soft-check it
 # inside extract_pdf_text() so calls fall back to PyPDF2 without crashing.
 
-def _load_odp_api_key() -> str:
-    """Return USPTO ODP API key from env var or well-known key files.
-
-    Search order:
-      1. USPTO_ODP_API_KEY environment variable
-      2. ~/.patent_qc_api_key        (any platform, simple one-line file)
-      3. ~/.claude/patent_qc_api_key (Claude Code users)
-
-    Key files support two formats:
-      - Raw key value on a single line: yourkey123
-      - Env-var indirection:           env:MY_CUSTOM_VAR_NAME
-        Useful when the key is already stored under a different name.
-
-    To obtain a key: register at https://developer.uspto.gov/
-    (Create Account → API Keys). Free; no approval required.
-    """
-    key = os.environ.get('USPTO_ODP_API_KEY', '').strip()
-    if key:
-        return key
-    for candidate in [
-        Path.home() / '.patent_qc_api_key',
-        Path.home() / '.claude' / 'patent_qc_api_key',
-    ]:
-        try:
-            content = candidate.read_text(encoding='utf-8').strip()
-            if not content:
+# ── Shared USPTO ODP client ──────────────────────────────────────────────────
+# Credential resolution and HTTP live in the uspto-odp skill so one fix serves every
+# skill. Resolution order matters: the installed skill wins, so updating it updates
+# every consumer; the vendored copy under scripts/_vendor/ exists only so this skill
+# still works when downloaded on its own. Neither present is not fatal -- ODP checks
+# are simply reported as unavailable.
+def _import_uspto_odp():
+    """Return the shared ODP client module, or None if it cannot be found."""
+    here = Path(__file__).resolve().parent
+    for directory in (
+        Path.home() / '.claude' / 'skills' / 'uspto-odp' / 'scripts',  # installed skill
+        here / '_vendor',                                              # bundled fallback
+        here,
+    ):
+        if (directory / 'uspto_odp.py').exists():
+            sys.path.insert(0, str(directory))
+            try:
+                import uspto_odp  # type: ignore
+                return uspto_odp
+            except ImportError:
                 continue
-            if content.lower().startswith('env:'):
-                key = os.environ.get(content[4:].strip(), '').strip()
-            else:
-                key = content
-            if key:
-                return key
-        except (OSError, IOError):
-            pass
-    return ''
+    return None
+
+
+uspto_odp = _import_uspto_odp()
+
+
+def _load_odp_api_key() -> str:
+    """Return the USPTO ODP API key via the shared client, or '' if unavailable.
+
+    Credential search order and setup help: run
+    `python uspto_odp.py setup` from the uspto-odp skill, or see its SKILL.md.
+    """
+    return uspto_odp.load_api_key() if uspto_odp is not None else ''
 
 
 # OCR support (optional)
@@ -6884,53 +6882,16 @@ class PatentFilingQC:
             return f"https://patentcenter.uspto.gov/applications/{clean}", None
 
         def _lookup_odp(raw_app, api_key):
-            """Call USPTO ODP API for a US application number.
-            Returns dict: {error, filing_date, status_desc, patent_number}.
-            PCT numbers are not indexable via this endpoint — callers skip them.
-            API endpoint: https://api.uspto.gov/api/v1/patent/applications/{appNum}/meta-data
-            Key registration: https://developer.uspto.gov/ (free, no approval required).
+            """Look up one application through the shared ODP client.
+
+            api_key is accepted for call-site compatibility but unused -- the shared
+            client resolves credentials itself. Contract is unchanged: a dict with
+            error / filing_date / status_desc / patent_number, never raising.
             """
-            if raw_app.upper().startswith('PCT'):
-                return {'error': 'pct_not_supported', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-            clean = re.sub(r'[/,.\s\-]', '', raw_app)
-            base = os.environ.get('USPTO_ODP_BASE_URL', 'https://api.uspto.gov/api/v1')
-            url = f"{base}/patent/applications/{clean}/meta-data"
-            req = urllib.request.Request(
-                url,
-                headers={'Accept': 'application/json', 'X-API-KEY': api_key}
-            )
-            for _attempt in range(2):  # one retry on 429
-                try:
-                    with urllib.request.urlopen(req, timeout=12) as resp:
-                        data = json.loads(resp.read().decode('utf-8-sig'))
-                    break
-                except urllib.error.HTTPError as exc:
-                    if exc.code == 429:
-                        try:
-                            retry_after = int(exc.headers.get('Retry-After', '5'))
-                        except (ValueError, AttributeError):
-                            retry_after = 5
-                        time.sleep(min(retry_after, 30))
-                        if _attempt == 1:
-                            return {'error': 'rate_limited', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-                        continue
-                    if exc.code in (404, 410):
-                        return {'error': 'not_found', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-                    if exc.code == 403:
-                        return {'error': 'bad_key', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-                    return {'error': f'http_{exc.code}', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-                except Exception as exc:
-                    return {'error': str(exc), 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-            else:
-                return {'error': 'rate_limited', 'filing_date': '', 'status_desc': '', 'patent_number': ''}
-            bag = data.get('patentFileWrapperDataBag') or []
-            meta = (bag[0].get('applicationMetaData') or {}) if bag else {}
-            return {
-                'error': None,
-                'filing_date': (meta.get('filingDate') or '').strip(),
-                'status_desc': (meta.get('applicationStatusDescriptionText') or '').strip(),
-                'patent_number': (meta.get('patentNumber') or '').strip(),
-            }
+            if uspto_odp is None:
+                return {'error': 'odp_client_unavailable', 'filing_date': '',
+                        'status_desc': '', 'patent_number': ''}
+            return uspto_odp.lookup_application(raw_app)
 
         # Build ADS number map: norm → (raw, date_str, entry_idx)
         ads_num_map = {}

@@ -1273,7 +1273,13 @@ def t():
 # 16. Check 81 — priority application number verification (offline Branch B)
 # ============================================================
 # Force the offline branch (no ODP key) so these tests never hit the network.
+# Clearing the env var alone does not do it: _load_odp_api_key() reads Windows
+# Credential Manager FIRST, so on a machine where the key is stored there —
+# the setup the skill documents — Check 81 took Branch A and these three tests
+# failed for environmental reasons on every run. Patch the resolver itself so
+# the branch under test is the branch that runs, wherever the suite runs.
 os.environ.pop('USPTO_ODP_API_KEY', None)
+_qcmod._load_odp_api_key = lambda: ''
 
 def _ads_with_continuity(app_num='12/345,678'):
     ads = copy.deepcopy(BASE_ADS)

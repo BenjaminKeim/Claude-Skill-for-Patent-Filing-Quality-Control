@@ -359,6 +359,19 @@ Each check produces one of these results, shown as a colored badge in the HTML r
 | **PASS** | green | Check passed, no action needed |
 | **N/A** | gray | Check skipped / not applicable (optional document absent or precondition unmet — e.g. no IDS, no foreign priority, non-biological application). Separate from PASS so the Pass count reflects only checks that verified something. |
 
+## USPTO ODP Lookups
+
+Live USPTO data (Check 81 priority-application verification) goes through the shared
+client in the **`uspto-odp`** skill (`~/.claude/skills/uspto-odp/scripts/uspto_odp.py`).
+This skill holds no ODP credential or HTTP code of its own — fix a bug or rotate the key
+there and every skill inherits it.
+
+If ODP verification is silently missing from a report, run the shared self-check first:
+
+```bash
+python ~/.claude/skills/uspto-odp/scripts/uspto_odp.py doctor
+```
+
 ## Known Limitations
 
 ### PDF Text Extraction
@@ -435,7 +448,8 @@ patent-filing-qc/
 │   └── example-report.png        # Screenshot used in this README
 ├── scripts/
 │   ├── qc_patent_filing.py       # Main QC script
-│   └── check_no_client_material.py  # Pre-commit scan for client/firm material
+│   ├── check_no_client_material.py  # Pre-commit scan for client/firm material
+│   └── _vendor/                  # Fallback copy of the shared USPTO ODP client
 ├── tests/
 │   ├── test_qc_patent_filing.py  # Regression suite
 │   └── README.md                 # What the suite covers
