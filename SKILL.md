@@ -175,8 +175,11 @@ The skill performs 70+ quality control checks across these categories:
 ### Document Completeness (4 checks)
 - All required documents present
 - ADS required fields complete
-- Declaration signatures present
-- Assignment signatures present (if included)
+- Declaration signatures present *(recognizes `/s/` and `/Name/` markers **and** handwritten ink signatures, which leave no text)*
+- Assignment signatures present (if included) *(same ink-signature handling)*
+
+### Environment (1 check)
+- **Optional components installed** — warns when pdfplumber, python-docx, or the OCR stack (pytesseract + pdf2image + tesseract + poppler) is missing, naming which checks are degraded. A missing OCR stack in particular means unreadable text layers cannot be repaired (see Script Details).
 
 ### Specification-Specific (15 checks)
 - Sequential claim numbering
@@ -295,8 +298,11 @@ The main QC script is located at `scripts/qc_patent_filing.py` and includes:
 - **Orientation-aware drawings extraction** — drawing sets routinely mix sheet and text orientations (upright portrait sheets, landscape sheets rotated either way, vertical callouts inside an otherwise upright sheet). The script classifies each character by the rotation in its text matrix (0°, ±90°, 180°), reconstructs each rotated run in true reading order, and repairs the garbled form in pdfplumber's linear output. A recovered word that can't be located in that output is appended to the page rather than dropped, so FIG. labels and docket headers always reach the checks
 - **Drawings exempt from repeating header/footer stripping** — on a drawing sheet the page-edge lines *are* the content (FIG. label at the bottom, docket/title at the top), so the boilerplate detector that cleans spec page furniture would strip exactly what checks 15, 22, 23 and 61 read
 - **Image-only-page detection** — cross-document inventor checks hedge findings when scanned signature pages are present
-- **Continuation-aware** date and docket checks
-- **OCR fallback** (pytesseract + pdf2image) for fully image-based PDFs
+- **Unreadable-text-layer repair (Declaration / Assignment)** — a page drawn in a font with no ToUnicode map extracts as well-formed-looking gibberish rather than as nothing, so a signed declaration silently stops counting and surfaces as a *missing* one. The script detects such pages by function-word density and re-reads them via OCR one page at a time, replacing the unreadable text (replacing, not appending, so per-page tallies stay honest). Requires the OCR stack — Check 87 warns when it's absent
+- **Per-page declaration counting** — a declaration form names exactly one inventor, so a page naming exactly one ADS inventor is one executed declaration and a page naming all of them is a roster, not a form. Four independent signals are taken (per-inventor pages, declaration statements, `/Name/` markers, handwritten signatures) and the strongest wins, since each fails differently
+- **Ink-signature detection** — signature strokes or a stamped signature image in the signature band of a page, so a properly executed handwritten declaration isn't reported unsigned
+- **Continuation-aware** date and docket checks, including naming the parent's docket on a declaration carried forward under 37 CFR 1.63(d)
+- **OCR fallback** (pytesseract + pdf2image) for fully image-based PDFs, and OCR-tolerant docket comparison (0/O, S/5 confusion folded for equality tests only, never for display)
 - **Optional authoritative-source inventor list** (`inventors.txt` / `inventors.json` / `*.eml`) for cross-checking against ADS / declaration / assignment
 - **Self-contained HTML report** with embedded CSS, clickable Executive Summary, and a Print-to-PDF button
 
