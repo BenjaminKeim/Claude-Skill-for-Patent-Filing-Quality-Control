@@ -367,6 +367,24 @@ class PatentFilingQC:
             'Declaration': None, 'Assignment': None, 'Power of Attorney': None,
             'IDS': None, 'IDS Written Assertion': None,
         }
+        # Every file classified as a POOLED_DOC_TYPES document, in load order.
+        # Executed declarations and assignments are routinely split across
+        # files (one PDF per inventor, or a late signer in a file of their
+        # own), so all of them are read and their text, per-page data and
+        # page tallies combined. self.documents[doc_type] still holds the
+        # highest-confidence file for checks that want a single path.
+        self.document_sets: Dict[str, List[Path]] = {}
+        # Source file for each entry in doc_pages, parallel to
+        # doc_page_numbers — page 2 of a pooled set is "page 2 of which file".
+        self.doc_page_sources: Dict[str, List[Path]] = {}
+        # Extracted text of each pooled file on its own, for Check 88's
+        # per-file inventor coverage.
+        self.doc_file_texts: Dict[str, Dict[Path, str]] = {}
+        # Set while a pooled set is being extracted: per-file OCR name
+        # recovery is deferred until every file has been read, so a file that
+        # names only its own inventor isn't OCR'd for names that are in the
+        # other files.
+        self._defer_name_ocr = False
         # A .docx copy of the specification, even if a .pdf was picked as the
         # filing copy in self.documents['Specification']. Checks that need
         # exact body text (e.g. the abstract word count, Check 17) should prefer
@@ -477,6 +495,7 @@ class PatentFilingQC:
                 pdf_path, doc_type, page_texts, page_numbers, garbled_positions)
             self.doc_pages[doc_type] = list(page_texts)
             self.doc_page_numbers[doc_type] = list(page_numbers)
+            self.doc_page_sources[doc_type] = [pdf_path] * len(page_texts)
             if ink_pages > 0:
                 self.ink_signature_pages[doc_type] = ink_pages
             text = self._join_page_texts(page_texts)
@@ -795,13 +814,15 @@ class PatentFilingQC:
         # Cap the work: the identifier block repeats on every sheet of a form
         # set, so a handful of pages answers the question for the document.
         numbers = self.doc_page_numbers.get(doc_type) or []
-        affected = [numbers[i] for i, pt in enumerate(pages)
+        sources = self.doc_page_sources.get(doc_type) or []
+        affected = [(sources[i] if i < len(sources) else pdf_path, numbers[i])
+                    for i, pt in enumerate(pages)
                     if '(cid:' in pt and i < len(numbers)][:3]
         if not affected:
             return ''
         print(f"  ℹ️  {doc_type}: docket/title header did not decode; "
               f"OCR-reading {len(affected)} page(s) to recover it...")
-        recovered = [self._ocr_single_page(pdf_path, n) for n in affected]
+        recovered = [self._ocr_single_page(src, n) for src, n in affected]
         return "\n".join(r for r in recovered if r)
 
     def _surname_present(self, surname_norm: str, norm_text: str) -> bool:
@@ -959,16 +980,24 @@ class PatentFilingQC:
         When OCR doesn't help, the cleaner original text is kept."""
         if doc_type not in ('Declaration', 'Assignment') or not OCR_AVAILABLE:
             return text
+        if self._defer_name_ocr:
+            return text  # _extract_pooled runs this once the whole set is read
         if not (self.ads_data and self.ads_data.get('inventors')):
             return text  # no authoritative names to test against
         total = len(self.ads_data['inventors'])
-        have = self._count_ads_inventors_present(text)
+        # Names another file of a pooled set already supplies don't need
+        # recovering from this one.
+        elsewhere = set()
+        for other, other_text in self.doc_file_texts.get(doc_type, {}).items():
+            if other != pdf_path:
+                elsewhere |= self._ads_inventors_named_in(other_text)
+        have = len(self._ads_inventors_named_in(text) | elsewhere)
         if have >= total:
             return text  # extraction already captured every inventor name
         print(f"  ℹ️  {doc_type}: only {have}/{total} inventor name(s) found in "
-              f"extracted text; running OCR to recover the rest...")
+              f"extracted text; running OCR on {pdf_path.name} to recover the rest...")
         ocr_text = self._ocr_pdf_text(pdf_path, doc_type)
-        if ocr_text and self._count_ads_inventors_present(ocr_text) > have:
+        if ocr_text and len(self._ads_inventors_named_in(ocr_text) | elsewhere) > have:
             print(f"  ✅ OCR recovered additional inventor name(s) in {doc_type}")
             return ocr_text
         return text
@@ -1438,6 +1467,79 @@ class PatentFilingQC:
             return self._extract_docx_text(path)
         return self.extract_pdf_text(path, doc_type)
 
+    # Document types whose executed copies are commonly split across several
+    # files. Every file classified as one of these is read, not just the best.
+    POOLED_DOC_TYPES = ('Declaration', 'Assignment')
+
+    def _document_paths(self, doc_type: str) -> List[Path]:
+        """Every file making up `doc_type`: the pooled set when there is one,
+        otherwise the single classified file."""
+        paths = self.document_sets.get(doc_type)
+        if paths:
+            return list(paths)
+        path = self.documents.get(doc_type)
+        return [path] if path else []
+
+    def _extract_pooled(self, paths: List[Path], doc_type: str) -> str:
+        """Read every file of a split declaration/assignment set as one
+        document.
+
+        Each file is extracted on its own — so header/footer stripping, the
+        unreadable-page repair and ink-signature detection all work per file —
+        and the per-page lists are then concatenated and the page tallies
+        summed. Checks downstream see the same structures as for a single
+        file, plus doc_page_sources to say which file a page came from.
+
+        OCR name recovery runs only after the whole set is read, and only for
+        names no file supplies: a one-inventor-per-file set would otherwise
+        OCR every file for the five names that are in the other five."""
+        tallies = (self.image_only_pages, self.ink_signature_pages,
+                   self.repaired_pages, self.unreadable_pages)
+        pages: List[str] = []
+        numbers: List[int] = []
+        sources: List[Path] = []
+        totals = [0] * len(tallies)
+        file_texts: Dict[Path, str] = {}
+        self.doc_file_texts[doc_type] = file_texts
+
+        self._defer_name_ocr = True
+        try:
+            for path in paths:
+                for tally in tallies:
+                    tally.pop(doc_type, None)
+                for per_page in (self.doc_pages, self.doc_page_numbers,
+                                 self.doc_page_sources):
+                    per_page.pop(doc_type, None)
+                file_texts[path] = self._extract_text_any(path, doc_type) or ""
+                for i, tally in enumerate(tallies):
+                    totals[i] += tally.get(doc_type, 0)
+                if doc_type in self.doc_pages:
+                    pages += self.doc_pages[doc_type]
+                    numbers += self.doc_page_numbers.get(doc_type, [])
+                    sources += self.doc_page_sources.get(doc_type, [])
+                elif file_texts[path].strip():
+                    # .docx or PyPDF2 fallback: no page split, one unit.
+                    pages.append(file_texts[path])
+                    numbers.append(1)
+                    sources.append(path)
+        finally:
+            self._defer_name_ocr = False
+
+        for path in paths:
+            if path.suffix.lower() == '.pdf':
+                file_texts[path] = self._maybe_ocr_for_names(
+                    path, doc_type, file_texts[path])
+
+        for i, tally in enumerate(tallies):
+            if totals[i]:
+                tally[doc_type] = totals[i]
+            else:
+                tally.pop(doc_type, None)
+        self.doc_pages[doc_type] = pages
+        self.doc_page_numbers[doc_type] = numbers
+        self.doc_page_sources[doc_type] = sources
+        return "\n".join(file_texts[p] for p in paths if file_texts[p])
+
     def _extract_acroform_fields(self, pdf_path: Path) -> Dict[str, str]:
         """Read AcroForm field values from a non-XFA PDF. Returns a dict
         {field_name: value_str}. Buttons (checkboxes / radios) come back as
@@ -1874,7 +1976,16 @@ class PatentFilingQC:
                         self.spec_docx_candidate = cand_path
                         break
 
-            if len(candidates) > 1:
+            pooled = doc_type in self.POOLED_DOC_TYPES and len(candidates) > 1
+            if pooled:
+                # Split execution set (e.g. one PDF per inventor): read every
+                # file. Overlap between files is Check 88's job, not a
+                # duplicate-file warning.
+                self.document_sets[doc_type] = [p for p, _ in candidates]
+                print(f"  ℹ️  {len(candidates)} files classified as {doc_type}; "
+                      f"reading all of them as one set: "
+                      f"{', '.join(p.name for p, _ in candidates)}")
+            elif len(candidates) > 1:
                 others = ', '.join(p.name for p, _ in candidates[1:])
                 print(f"  ⚠️  Multiple files classified as {doc_type}; using "
                       f"{best_path.name} (also matched: {others})")
@@ -1921,9 +2032,13 @@ class PatentFilingQC:
             elif doc_type == 'ADS':
                 self.ads_text = self._extract_ads_text(best_path)
             elif doc_type == 'Declaration':
-                self.declaration_text = self._extract_text_any(best_path, 'Declaration')
+                self.declaration_text = (
+                    self._extract_pooled(self.document_sets[doc_type], doc_type)
+                    if pooled else self._extract_text_any(best_path, 'Declaration'))
             elif doc_type == 'Assignment':
-                self.assignment_text = self._extract_text_any(best_path, 'Assignment')
+                self.assignment_text = (
+                    self._extract_pooled(self.document_sets[doc_type], doc_type)
+                    if pooled else self._extract_text_any(best_path, 'Assignment'))
             elif doc_type == 'Power of Attorney':
                 self.poa_text = self._extract_text_any(best_path, 'Power of Attorney')
             elif doc_type == 'IDS':
@@ -2626,6 +2741,7 @@ class PatentFilingQC:
         self.check_ads()
         self.check_declaration()
         self.check_assignment()
+        self.check_split_execution_sets()
         self.check_poa()
         self.check_ids()
         self.check_sequence_listing()
@@ -2636,7 +2752,78 @@ class PatentFilingQC:
         self.check_priority()
         self.check_caf()
         self.check_final_quality()
-    
+
+    def _inventors_executed_in_file(self, doc_type: str, path: Path) -> set:
+        """ADS inventors whose own executed form is in `path`: those named
+        alone on some page of that file. A page naming several inventors is a
+        roster or cover sheet, not anyone's form, so it doesn't count — the
+        same per-page rule _count_declaration_units uses. Falls back to the
+        whole file's text when no page split is available."""
+        pages = self.doc_pages.get(doc_type) or []
+        sources = self.doc_page_sources.get(doc_type) or []
+        found: set = set()
+        for page_text, src in zip(pages, sources):
+            if src == path:
+                named = self._ads_inventors_named_in(page_text)
+                if len(named) == 1:
+                    found |= named
+        if not found and path not in sources:
+            found = self._ads_inventors_named_in(
+                self.doc_file_texts.get(doc_type, {}).get(path, ''))
+        return found
+
+    def check_split_execution_sets(self):
+        """Check 88: when a declaration or assignment is split across several
+        files, report which inventor each file covers and whether any
+        inventor's form appears in more than one file.
+
+        A second executed copy is harmless to file, so overlap is INFO, not a
+        warning — but it's worth knowing, because it is also what a stale or
+        superseded copy left in the folder looks like."""
+        for doc_type in self.POOLED_DOC_TYPES:
+            paths = self.document_sets.get(doc_type) or []
+            if len(paths) < 2:
+                continue
+            title = f"Split {doc_type} Set — Coverage and Duplicates"
+            if not (self.ads_data and self.ads_data.get('inventors')):
+                self.report.add_issue(
+                    88, doc_type, title, Severity.INFO,
+                    f"{doc_type} read from {len(paths)} files as one set; "
+                    f"per-file inventor coverage needs ADS inventor data",
+                    "\n".join(f"  • {p.name}" for p in paths))
+                continue
+            coverage = {p: self._inventors_executed_in_file(doc_type, p)
+                        for p in paths}
+            lines = []
+            for p in paths:
+                names = sorted(coverage[p])
+                lines.append(f"  • {p.name}: "
+                             + (", ".join(names) if names else
+                                "no inventor identified by text (may be scanned "
+                                "or ink-signed pages)"))
+            files_by_inventor: Dict[str, List[str]] = {}
+            for p in paths:
+                for name in coverage[p]:
+                    files_by_inventor.setdefault(name, []).append(p.name)
+            dupes = {n: fs for n, fs in files_by_inventor.items() if len(fs) > 1}
+            if dupes:
+                dupe_lines = [f"  • {n}: {', '.join(fs)}"
+                              for n, fs in sorted(dupes.items())]
+                self.report.add_issue(
+                    88, doc_type, title, Severity.INFO,
+                    f"{doc_type} read from {len(paths)} files as one set; "
+                    f"{len(dupes)} inventor(s) appear in more than one file",
+                    "Inventors with an executed form in more than one file "
+                    "(harmless if both copies are current — confirm neither "
+                    "is a superseded draft):\n" + "\n".join(dupe_lines)
+                    + "\n\nCoverage by file:\n" + "\n".join(lines))
+            else:
+                self.report.add_issue(
+                    88, doc_type, title, Severity.PASS,
+                    f"{doc_type} read from {len(paths)} files as one set; "
+                    f"no inventor appears in more than one file",
+                    "Coverage by file:\n" + "\n".join(lines))
+
     def check_environment(self):
         """Check 87: surface optional components that aren't installed, so the
         user knows which checks are degraded rather than the tool failing
@@ -4729,7 +4916,8 @@ class PatentFilingQC:
         date_matches = find_dates(decl_text_for_date)
         if not date_matches and OCR_AVAILABLE and self.documents.get('Declaration'):
             try:
-                images = convert_from_path(self.documents['Declaration'])
+                images = [img for p in self._document_paths('Declaration')
+                          for img in convert_from_path(p)]
                 ocr_text = '\n'.join(pytesseract.image_to_string(img) for img in images)
                 date_matches = find_dates(ocr_text)
             except Exception:
@@ -5008,7 +5196,8 @@ class PatentFilingQC:
         # Try OCR fallback if no date found
         if not found_date and OCR_AVAILABLE and self.documents.get('Assignment'):
             try:
-                images = convert_from_path(self.documents['Assignment'])
+                images = [img for p in self._document_paths('Assignment')
+                          for img in convert_from_path(p)]
                 ocr_text = '\n'.join(pytesseract.image_to_string(img) for img in images)
                 for pattern in date_search_patterns:
                     match = re.search(pattern, ocr_text, re.IGNORECASE)
@@ -8091,7 +8280,13 @@ class PatentFilingQC:
             f.write("<h2>Documents Found</h2>\n")
             f.write("<table>\n<thead><tr><th>Document Type</th><th>File</th></tr></thead>\n<tbody>\n")
             for doc_type, filename in self.report.files_found.items():
-                if filename:
+                pooled_set = self.document_sets.get(doc_type) or []
+                if len(pooled_set) > 1:
+                    names = "<br>".join(esc(p.name) for p in pooled_set)
+                    f.write(f"<tr><td>{esc(doc_type)} "
+                            f"({len(pooled_set)} files, read as one set)</td>"
+                            f"<td class=\"docfound\">{names}</td></tr>\n")
+                elif filename:
                     f.write(f"<tr><td>{esc(doc_type)}</td>"
                             f"<td class=\"docfound\">{esc(filename)}</td></tr>\n")
                 else:
