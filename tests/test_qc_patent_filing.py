@@ -1830,6 +1830,87 @@ def t():
         print("  ❌ ordinary form no longer matched"); return False
     return True
 
+# ============================================================
+# RD17. Split declaration / assignment sets (one PDF per inventor, or a
+# late signer in a file of their own) are read as one document.
+# ============================================================
+_SAMPLE_PAGE = _GOOD_PAGE.replace("Alice J. EXAMPLE", "Carol Dana SAMPLE")
+
+def _fake_pooled_qc(file_pages, image_only=None, ink=None):
+    """A QC whose per-file extraction returns canned pages, mimicking what
+    extract_pdf_text records for each file."""
+    qc = build_qc()
+    image_only = image_only or {}
+    ink = ink or {}
+    def fake_extract(path, doc_type):
+        pages = file_pages[path.name]
+        qc.doc_pages[doc_type] = list(pages)
+        qc.doc_page_numbers[doc_type] = list(range(1, len(pages) + 1))
+        qc.doc_page_sources[doc_type] = [path] * len(pages)
+        if path.name in image_only:
+            qc.image_only_pages[doc_type] = image_only[path.name]
+        if path.name in ink:
+            qc.ink_signature_pages[doc_type] = ink[path.name]
+        return "\n".join(pages)
+    qc._extract_text_any = fake_extract
+    return qc
+
+@test("RD17.1: split declaration files pooled — text, pages, tallies combined")
+def t():
+    qc = _fake_pooled_qc({"Decl-EXAMPLE.pdf": [_GOOD_PAGE], "Decl-SAMPLE.pdf": [_SAMPLE_PAGE]},
+                         image_only={"Decl-SAMPLE.pdf": 1}, ink={"Decl-EXAMPLE.pdf": 1,
+                                                              "Decl-SAMPLE.pdf": 1})
+    paths = [WORK / "Decl-EXAMPLE.pdf", WORK / "Decl-SAMPLE.pdf"]
+    qc.document_sets['Declaration'] = paths
+    qc.declaration_text = qc._extract_pooled(paths, 'Declaration')
+    if "EXAMPLE" not in qc.declaration_text or "SAMPLE" not in qc.declaration_text:
+        print("  ❌ pooled text missing one file's inventor"); return False
+    if len(qc.doc_pages['Declaration']) != 2:
+        print(f"  ❌ {len(qc.doc_pages['Declaration'])} pooled pages (expected 2)"); return False
+    if qc.doc_page_sources['Declaration'] != paths:
+        print("  ❌ page sources don't track their files"); return False
+    if qc.ink_signature_pages.get('Declaration') != 2 or qc.image_only_pages.get('Declaration') != 1:
+        print("  ❌ per-file tallies not summed"); return False
+    count, _ = qc._count_declaration_units()
+    if count != 2:
+        print(f"  ❌ counted {count} declarations (expected 2)"); return False
+    return True
+
+@test("RD17.2: Check 88 PASSes a split set with no overlap and names each file")
+def t():
+    qc = _fake_pooled_qc({"Decl-EXAMPLE.pdf": [_GOOD_PAGE], "Decl-SAMPLE.pdf": [_SAMPLE_PAGE]})
+    paths = [WORK / "Decl-EXAMPLE.pdf", WORK / "Decl-SAMPLE.pdf"]
+    qc.document_sets['Declaration'] = paths
+    qc.declaration_text = qc._extract_pooled(paths, 'Declaration')
+    qc.check_split_execution_sets()
+    issue = get_check(qc, 88)
+    if not issue or issue.severity != Severity.PASS:
+        print(f"  ❌ Check 88 = {issue.severity.value if issue else 'absent'} (expected PASS)"); return False
+    if "Decl-SAMPLE.pdf: Carol Dana SAMPLE" not in issue.details:
+        print(f"  ❌ coverage by file missing: {issue.details[:150]}"); return False
+    return True
+
+@test("RD17.3: Check 88 INFO when one inventor's form is in two files; roster page ignored")
+def t():
+    roster = "Inventors: Alice J. EXAMPLE and Carol Dana SAMPLE"
+    qc = _fake_pooled_qc({"Decl-ALL.pdf": [roster, _GOOD_PAGE, _SAMPLE_PAGE],
+                          "Decl-SAMPLE.pdf": [_SAMPLE_PAGE]})
+    paths = [WORK / "Decl-ALL.pdf", WORK / "Decl-SAMPLE.pdf"]
+    qc.document_sets['Declaration'] = paths
+    qc.declaration_text = qc._extract_pooled(paths, 'Declaration')
+    qc.check_split_execution_sets()
+    issue = get_check(qc, 88)
+    if not issue or issue.severity != Severity.INFO:
+        print(f"  ❌ Check 88 = {issue.severity.value if issue else 'absent'} (expected INFO)"); return False
+    if "1 inventor(s)" not in issue.message or "Alice J. EXAMPLE: Decl" in issue.details:
+        print(f"  ❌ wrong duplicate set: {issue.message} / {issue.details[:200]}"); return False
+    return True
+
+@test("RD17.4: Check 88 silent when declaration is a single file")
+def t():
+    qc = build_qc()
+    qc.check_split_execution_sets()
+    return get_check(qc, 88) is None
 
 # ============================================================
 # 13. Issue fixes: #38 header/footer stripping, #34 .docx abstract preference

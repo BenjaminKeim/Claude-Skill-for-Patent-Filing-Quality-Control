@@ -33,6 +33,8 @@ Confirm the folder path containing all filing documents. The folder should typic
 
 **Filenames don't matter — the script identifies documents by their *content*, not their names.** A specification named `Application.pdf`, a declaration named `Formals.pdf`, or any other naming convention works as long as the content of the file is recognizable. XFA forms (any PTO/AIA/* form, not just the ADS) are classified by inspecting their embedded XML rather than assuming form type from the filename.
 
+**Split declarations and assignments are read as one set.** Executed declarations and assignments are often split across files — one PDF per inventor, or a late signer in a file of their own. Every file classified as a Declaration (or an Assignment) is read, and the files are checked together as one document: the inventor coverage, signature, and page-count checks see all of them. Do not merge the PDFs yourself before running the script. The report's Documents Found table lists each file in the set, and Check 88 reports which inventor each file covers. If one inventor's form turns up in more than one file, Check 88 marks it INFO, not a warning: a second executed copy is harmless to file, but it can also be a superseded copy left in the folder. Other document types still use the single best-matching file and warn about duplicates.
+
 **Format-wise, the spec can be `.docx` or `.pdf`.** The USPTO accepts the specification in Word format, and so does this tool — the classifier reads .docx the same way it reads PDFs and routes it to the Specification slot when its content matches. Other documents (declaration, ADS, drawings, assignment, POA) should be PDFs.
 
 **Note on the ADS:** The USPTO web-fillable ADS (PTO/AIA/14) is an XFA form. The script reads the form's embedded XFA datasets stream directly, so no Adobe Acrobat Pro flattening is required. If the ADS extraction succeeds, the console will show `✅ XFA extraction successful` — every ADS field needed for cross-document checks is then available structured.
@@ -203,6 +205,9 @@ The skill performs 70+ quality control checks across these categories:
 - Correspondence address complete
 - Attorney/agent registration numbers
 - **Attorney vs. correspondence customer number** *(when XFA data available — warns on mismatch between the two customer-number fields)*
+
+### Split Execution Sets (1 conditional check)
+- **Check 88 — Split Declaration/Assignment Set: Coverage and Duplicates** *(only when more than one file is classified as a Declaration or an Assignment)* — lists the inventors each file covers (an inventor counts only when named alone on a page, so a roster page doesn't count); PASS when no inventor appears in two files, INFO when one does
 
 ### Declaration-Specific (4 checks)
 - All inventors named
